@@ -28,7 +28,7 @@ func mapF(filename string, contents string) []mapreduce.KeyValue {
 		counts[word]++
 	}
 
-	var results []mapreduce.KeyValue
+	var results = make([]mapreduce.KeyValue, 0, len(words))
 	for k, v := range counts {
 		//fmt.Printf("k = %v, v = %v", k, v)
 		results = append(results, mapreduce.KeyValue{Key: k, Value: strconv.Itoa(v)})
@@ -47,10 +47,10 @@ func reduceF(key string, values []string) string {
 	result := 0
 	for _, value := range values {
 		val, err := strconv.Atoi(value)
-		result += val
 		if err != nil {
 			fmt.Errorf("reduceF: %v", err)
 		}
+		result += val
 	}
 
 	return strconv.Itoa(result)

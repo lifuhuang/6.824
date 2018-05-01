@@ -72,7 +72,7 @@ func doReduce(
 		}
 	}
 
-	var keys []string
+	var keys = make([]string, 0, len(valuesByKey))
 	for key := range valuesByKey {
 		keys = append(keys, key)
 	}
