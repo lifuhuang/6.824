@@ -51,9 +51,10 @@ func schedule(jobName string, mapFiles []string, nReduce int, phase jobPhase, re
 		go func() {
 			defer wg.Done()
 			ok := call(worker, "Worker.DoTask", args, nil)
-			if ok {
-				registerChan <- worker
+			if !ok {
+				fmt.Printf("Error while calling worker %v", worker)
 			}
+			registerChan <- worker
 		}()
 	}
 
