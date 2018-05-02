@@ -16,7 +16,7 @@ func mapF(document string, value string) (res []mapreduce.KeyValue) {
 	// Your code here (Part V).
 	counts := make(map[string]bool)
 
-	words := strings.FieldsFunc(contents, func(ch rune) bool {
+	words := strings.FieldsFunc(value, func(ch rune) bool {
 		return !unicode.IsLetter(ch)
 	})
 
@@ -25,7 +25,7 @@ func mapF(document string, value string) (res []mapreduce.KeyValue) {
 	}
 
 	var results = make([]mapreduce.KeyValue, 0, len(words))
-	for k, v := range counts {
+	for k := range counts {
 		results = append(results, mapreduce.KeyValue{Key: k, Value: document})
 	}
 
@@ -37,7 +37,7 @@ func mapF(document string, value string) (res []mapreduce.KeyValue) {
 // should be a single output value for that key.
 func reduceF(key string, values []string) string {
 	// Your code here (Part V).
-	return fmt.Sprintf("%v: %d %s\n", key, len(values), strings.Join(values, ","))
+	return fmt.Sprintf("%d %s\n", len(values), strings.Join(values, ","))
 }
 
 // Can be run in 3 ways:
