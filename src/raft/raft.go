@@ -17,8 +17,12 @@ package raft
 //   in the same server.
 //
 
-import "sync"
-import "labrpc"
+import (
+	"labrpc"
+	"math/rand"
+	"sync"
+	"time"
+)
 
 // import "bytes"
 // import "labgob"
@@ -56,7 +60,7 @@ type Raft struct {
 	// Persistent state on all servers.
 	currentTerm int
 	votedFor    int
-	log         []interface{}
+	log         []LogEntry
 
 	// Volatile state on all servers.
 	commitIndex int
@@ -66,6 +70,14 @@ type Raft struct {
 	// Volitile state on leaders.
 	nextIndex  []int
 	matchIndex []int
+
+	// Channels
+	chanAppendEntries chan bool
+}
+
+type LogEntry struct {
+	term    int
+	command interface{}
 }
 
 type Role int
@@ -76,6 +88,8 @@ const (
 	candidate
 )
 
+const heartBeatPeriod int = 150
+
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
@@ -83,8 +97,11 @@ func (rf *Raft) GetState() (int, bool) {
 	var term int
 	var isleader bool
 	// Your code here (2A).
+
+	rf.mu.Lock()
 	term = rf.currentTerm
 	isleader = (rf.role == leader)
+	rf.mu.Unlock()
 
 	return term, isleader
 }
@@ -133,10 +150,10 @@ func (rf *Raft) readPersist(data []byte) {
 //
 type RequestVoteArgs struct {
 	// Your data here (2A, 2B).
-	term         int
-	candidateId  int
-	lastLogIndex int
-	lastLogTerm  int
+	Term         int
+	CandidateID  int
+	LastLogIndex int
+	LastLogTerm  int
 }
 
 //
@@ -145,8 +162,8 @@ type RequestVoteArgs struct {
 //
 type RequestVoteReply struct {
 	// Your data here (2A).
-	term        int
-	voteGranted bool
+	Term        int
+	VoteGranted bool
 }
 
 //
@@ -154,9 +171,33 @@ type RequestVoteReply struct {
 //
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
-	if args.term > rf.currentTerm || rf.votedFor {
-		rf.currentTerm = args.term
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	// initialize follower
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.votedFor = -1
 	}
+
+	reply.Term = rf.currentTerm
+
+	if args.Term < rf.currentTerm || rf.votedFor != -1 {
+		reply.VoteGranted = false
+		return
+	}
+
+	// Up-to-date check
+	lastLogTerm := rf.log[len(rf.log)-1].term
+	lastLogIndex := len(rf.log) - 1
+	reply.VoteGranted = (args.LastLogTerm > lastLogTerm) || (args.LastLogIndex == lastLogTerm && args.LastLogIndex >= lastLogIndex)
+
+	if reply.VoteGranted {
+		rf.votedFor = args.CandidateID
+	}
+
+	return
 }
 
 //
@@ -248,14 +289,185 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// Your initialization code here (2A, 2B, 2C).
 	rf.currentTerm = 0
 	rf.votedFor = -1
-	rf.log = make([]interface{})
+	rf.log = []LogEntry{LogEntry{}}
 
 	rf.role = follower
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 
+	rf.chanAppendEntries = make(chan bool)
+
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+	go func() {
+		for {
+			switch rf.role {
+			case follower:
+				rf.RunFollower()
+			case candidate:
+				rf.RunCandidate()
+			case leader:
+				rf.RunLeader()
+			}
+		}
+	}()
+
 	return rf
+}
+
+func (rf *Raft) RunFollower() {
+	timer := time.NewTimer(randomElectionTimeout())
+	for rf.role == follower {
+		select {
+		case <-timer.C:
+			rf.role = candidate
+		case <-rf.chanAppendEntries:
+			timer.Reset(randomElectionTimeout())
+		}
+	}
+}
+
+func (rf *Raft) RunCandidate() {
+	for {
+		select {
+		case result := <-rf.StartElection():
+			if result {
+				rf.role = leader
+				return
+			}
+		case <-rf.chanAppendEntries:
+			rf.role = follower
+			return
+		}
+	}
+}
+
+func (rf *Raft) StartElection() <-chan bool {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	timeout := time.After(randomElectionTimeout())
+
+	rf.votedFor = rf.me
+	rf.currentTerm++
+
+	args := &RequestVoteArgs{
+		CandidateID:  rf.me,
+		LastLogIndex: len(rf.log) - 1,
+		LastLogTerm:  rf.log[len(rf.log)-1].term,
+		Term:         rf.currentTerm,
+	}
+
+	nPeers := len(rf.peers)
+	voteChan := make(chan bool, nPeers)
+	for peer := range rf.peers {
+		if peer != rf.me {
+			go func() {
+				reply := new(RequestVoteReply)
+				if !rf.sendRequestVote(peer, args, reply) {
+					panic("Failed to send request vote")
+				}
+
+				rf.mu.Lock()
+				if reply.Term > rf.currentTerm {
+					rf.currentTerm = args.Term
+					rf.votedFor = -1
+				}
+				rf.mu.Unlock()
+
+				voteChan <- reply.VoteGranted
+			}()
+		}
+	}
+
+	resultChan := make(chan bool)
+	go func() {
+		totalVotes := 1
+		for i := 0; i < nPeers-1; i++ {
+			select {
+			case result := <-voteChan:
+				if result {
+					totalVotes++
+				}
+			case <-timeout:
+				resultChan <- false
+				return
+			}
+
+			if totalVotes > nPeers/2 {
+				resultChan <- true
+				return
+			}
+		}
+
+		resultChan <- false
+	}()
+
+	return resultChan
+}
+
+func (rf *Raft) RunLeader() {
+	// TODO
+}
+
+type AppendEntriesArgs struct {
+	Term         int
+	LeaderID     int
+	PrevLogIndex int
+	PrevLogTerm  int
+	Entries      []LogEntry
+	LeaderCommit int
+}
+
+type AppendEntriesReply struct {
+	Term    int
+	Success bool
+}
+
+func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
+	go func() { rf.chanAppendEntries <- true }()
+
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+
+	// initialize follower
+	if args.Term > rf.currentTerm {
+		rf.currentTerm = args.Term
+		rf.votedFor = -1
+	}
+
+	reply.Term = rf.currentTerm
+
+	if args.Term < rf.currentTerm || len(rf.log)-1 < args.PrevLogIndex || rf.log[args.PrevLogIndex].term != args.PrevLogTerm {
+		reply.Success = false
+		return
+	}
+
+	for i := 0; i < len(args.Entries); i++ {
+		pos := args.PrevLogIndex + 1 + i
+		if pos == len(rf.log) || rf.log[pos].term != args.Entries[i].term {
+			rf.log = append(rf.log[:pos], args.Entries[i:]...)
+			break
+		}
+	}
+
+	rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
+
+	leaderCommit := args.LeaderCommit
+	lastNewEntryIndex := args.PrevLogIndex + len(args.Entries)
+	if lastNewEntryIndex < leaderCommit {
+		leaderCommit = lastNewEntryIndex
+	}
+
+	if leaderCommit > rf.commitIndex {
+		rf.commitIndex = leaderCommit
+	}
+
+	reply.Success = true
+	return
+}
+
+func randomElectionTimeout() time.Duration {
+	return time.Duration(300 + rand.Int()%300)
 }
