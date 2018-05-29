@@ -251,13 +251,17 @@ func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *Reques
 // the leader.
 //
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	index := -1
-	term := -1
-	isLeader := true
-
 	// Your code here (2B).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 
-	return index, term, isLeader
+	if rf.role != leader {
+		return -1, -1, false
+	}
+
+	rf.log = append(rf.log, LogEntry{Term: rf.currentTerm, Command: command})
+
+	return len(rf.log) - 1, rf.currentTerm, true
 }
 
 //
@@ -319,42 +323,48 @@ func Make(peers []*labrpc.ClientEnd, me int,
 }
 
 func (rf *Raft) runFollower() {
-	timer := time.NewTimer(randomElectionTimeout())
 	for rf.role == follower {
 		select {
-		case <-timer.C:
+		case <-time.After(randomElectionTimeout()):
 			rf.mu.Lock()
 			rf.role = candidate
 			rf.mu.Unlock()
 		case <-rf.appendEntriesChan:
-			timer.Reset(randomElectionTimeout())
 		}
 	}
 }
 
 func (rf *Raft) runCandidate() {
 	for rf.role == candidate {
+		quit := make(chan bool, 1)
 		select {
-		case result := <-rf.startElection():
+		case result := <-rf.startElection(quit):
 			rf.mu.Lock()
 			if result && rf.role == candidate {
-				rf.printLog("Won election!!!!")
-				rf.role = leader
-				rf.mu.Unlock()
-				return
+				rf.printLog("won election")
+				rf.initLeader()
 			}
 			rf.mu.Unlock()
+		case <-time.After(randomElectionTimeout()):
+			quit <- true
 		case <-rf.appendEntriesChan:
-			break
 		}
 	}
 }
 
-func (rf *Raft) startElection() <-chan bool {
+func (rf *Raft) runLeader() {
+	for rf.role == leader {
+		select {
+		case <-time.After(heartBeatPeriod):
+			rf.broadcastAppendEntries()
+		case <-rf.appendEntriesChan:
+		}
+	}
+}
+
+func (rf *Raft) startElection(quit chan bool) <-chan bool {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-
-	timeout := time.After(randomElectionTimeout())
 
 	rf.votedFor = rf.me
 	rf.currentTerm++
@@ -368,13 +378,12 @@ func (rf *Raft) startElection() <-chan bool {
 	}
 
 	nPeers := len(rf.peers)
-	voteChan := make(chan bool, nPeers)
+	voteChan := make(chan bool, nPeers-1)
 	for i := 0; i < len(rf.peers); i++ {
 		if i != rf.me {
 			go func(server int) {
 				reply := new(RequestVoteReply)
-				if !rf.sendRequestVote(server, args, reply) {
-					panic("Failed to send request vote")
+				for !rf.sendRequestVote(server, args, reply) {
 				}
 
 				rf.mu.Lock()
@@ -388,7 +397,7 @@ func (rf *Raft) startElection() <-chan bool {
 		}
 	}
 
-	resultChan := make(chan bool)
+	resultChan := make(chan bool, 1)
 	go func() {
 		totalVotes := 1
 		for i := 0; i < nPeers-1; i++ {
@@ -397,7 +406,7 @@ func (rf *Raft) startElection() <-chan bool {
 				if result {
 					totalVotes++
 				}
-			case <-timeout:
+			case <-quit:
 				resultChan <- false
 				return
 			}
@@ -414,7 +423,7 @@ func (rf *Raft) startElection() <-chan bool {
 	return resultChan
 }
 
-func (rf *Raft) broadcastHeartBeat() {
+func (rf *Raft) broadcastAppendEntries() {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -432,31 +441,20 @@ func (rf *Raft) broadcastHeartBeat() {
 				}
 				rf.mu.Unlock()
 
-				rf.printLog("Sending heartbeat to " + strconv.Itoa(server))
-				for !rf.sendAppendEntries(server, args, reply) {
-				}
+				rf.printLog("Sending AppendEntries to " + strconv.Itoa(server))
+				for {
+					for !rf.sendAppendEntries(server, args, reply) {
+					}
 
-				rf.mu.Lock()
-				if reply.Term > rf.currentTerm {
-					rf.resetFollower(reply.Term)
+					rf.mu.Lock()
+					if reply.Term > rf.currentTerm {
+						rf.resetFollower(reply.Term)
+						rf.mu.Unlock()
+						return
+					}
 					rf.mu.Unlock()
-					return
 				}
-				rf.mu.Unlock()
-
-				// TODO: on failure to append
 			}(i)
-		}
-	}
-}
-
-func (rf *Raft) runLeader() {
-	for rf.role == leader {
-		select {
-		case <-time.After(heartBeatPeriod):
-			rf.broadcastHeartBeat()
-		case <-rf.appendEntriesChan:
-			break
 		}
 	}
 }
@@ -549,6 +547,18 @@ func (rf *Raft) resetFollower(term int) {
 	rf.currentTerm = term
 	rf.role = follower
 	rf.votedFor = -1
+}
+
+func (rf *Raft) initLeader() {
+	rf.role = leader
+	n := len(rf.peers)
+	rf.nextIndex = make([]int, n, n)
+	rf.matchIndex = make([]int, n, n)
+
+	for i := 0; i < n; i++ {
+		rf.nextIndex[i] = len(rf.log)
+		rf.matchIndex[i] = 0
+	}
 }
 
 func randomElectionTimeout() time.Duration {
