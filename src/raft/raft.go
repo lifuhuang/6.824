@@ -174,7 +174,6 @@ type RequestVoteReply struct {
 func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// Your code here (2A, 2B).
 
-	rf.printLog("Received RequestVote")
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -183,6 +182,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.resetFollower(args.Term)
 	}
 
+	rf.printLog("Received RequestVote")
 	reply.Term = rf.currentTerm
 
 	if args.Term < rf.currentTerm || rf.votedFor != -1 {
@@ -337,17 +337,20 @@ func (rf *Raft) runFollower() {
 func (rf *Raft) runCandidate() {
 	for rf.role == candidate {
 		quit := make(chan bool, 1)
-		select {
-		case result := <-rf.startElection(quit):
-			rf.mu.Lock()
-			if result && rf.role == candidate {
-				rf.printLog("won election")
-				rf.initLeader()
+		done := make(chan bool, 1)
+		timeout := time.After(randomElectionTimeout())
+
+		go rf.startElection(quit, done)
+
+		waitingForResult := true
+		for rf.role == candidate && waitingForResult {
+			select {
+			case <-done:
+			case <-timeout:
+				quit <- true
+				waitingForResult = false
+			case <-rf.appendEntriesChan:
 			}
-			rf.mu.Unlock()
-		case <-time.After(randomElectionTimeout()):
-			quit <- true
-		case <-rf.appendEntriesChan:
 		}
 	}
 }
@@ -362,7 +365,7 @@ func (rf *Raft) runLeader() {
 	}
 }
 
-func (rf *Raft) startElection(quit chan bool) <-chan bool {
+func (rf *Raft) startElection(quit <-chan bool, done chan<- bool) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -397,8 +400,8 @@ func (rf *Raft) startElection(quit chan bool) <-chan bool {
 		}
 	}
 
-	resultChan := make(chan bool, 1)
 	go func() {
+		defer func() { done <- true }()
 		totalVotes := 1
 		for i := 0; i < nPeers-1; i++ {
 			select {
@@ -407,20 +410,19 @@ func (rf *Raft) startElection(quit chan bool) <-chan bool {
 					totalVotes++
 				}
 			case <-quit:
-				resultChan <- false
-				return
 			}
 
 			if totalVotes > nPeers/2 {
-				resultChan <- true
+				rf.mu.Lock()
+				if rf.currentTerm == args.Term {
+					rf.initLeader()
+					rf.printLog("won election")
+				}
+				rf.mu.Unlock()
 				return
 			}
 		}
-
-		resultChan <- false
 	}()
-
-	return resultChan
 }
 
 func (rf *Raft) broadcastAppendEntries() {
@@ -482,7 +484,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	rf.printLog("Received AppendEntries")
+	//rf.printLog("Received AppendEntries")
 	// Stepdown
 	if args.Term > rf.currentTerm {
 		rf.printLog("stepping down")
