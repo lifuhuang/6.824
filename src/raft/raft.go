@@ -336,22 +336,21 @@ func (rf *Raft) runFollower() {
 
 func (rf *Raft) runCandidate() {
 	for rf.role == candidate {
-		quit := make(chan bool, 1)
-		done := make(chan bool, 1)
+		cancel := make(chan struct{})
 		timeout := time.After(randomElectionTimeout())
-
-		go rf.startElection(quit, done)
+		done := rf.startElection(cancel)
 
 		waitingForResult := true
 		for rf.role == candidate && waitingForResult {
 			select {
 			case <-done:
+				waitingForResult = false
 			case <-timeout:
-				quit <- true
 				waitingForResult = false
 			case <-rf.appendEntriesChan:
 			}
 		}
+		close(cancel)
 	}
 }
 
@@ -365,7 +364,7 @@ func (rf *Raft) runLeader() {
 	}
 }
 
-func (rf *Raft) startElection(quit <-chan bool, done chan<- bool) {
+func (rf *Raft) startElection(cancel <-chan struct{}) <-chan struct{} {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
@@ -400,8 +399,9 @@ func (rf *Raft) startElection(quit <-chan bool, done chan<- bool) {
 		}
 	}
 
+	done := make(chan struct{})
 	go func() {
-		defer func() { done <- true }()
+		defer func() { close(done) }()
 		totalVotes := 1
 		for i := 0; i < nPeers-1; i++ {
 			select {
@@ -409,7 +409,8 @@ func (rf *Raft) startElection(quit <-chan bool, done chan<- bool) {
 				if result {
 					totalVotes++
 				}
-			case <-quit:
+			case <-cancel:
+				return
 			}
 
 			if totalVotes > nPeers/2 {
@@ -423,6 +424,8 @@ func (rf *Raft) startElection(quit <-chan bool, done chan<- bool) {
 			}
 		}
 	}()
+
+	return done
 }
 
 func (rf *Raft) broadcastAppendEntries() {
