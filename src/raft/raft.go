@@ -195,7 +195,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	lastLogTerm := rf.log[len(rf.log)-1].Term
 	lastLogIndex := len(rf.log) - 1
 	reply.VoteGranted = (args.LastLogTerm > lastLogTerm) || (args.LastLogTerm == lastLogTerm && args.LastLogIndex >= lastLogIndex)
-	rf.printLog("voteGranted = %v, candidate = %v, args.LastLogTerm = %v, lastLogTerm = %v, args.LastLogIndex = %v, lastLogIndex = %v", reply.VoteGranted, args.CandidateID, args.LastLogTerm, lastLogTerm, args.LastLogIndex, lastLogIndex)
+	//rf.printLog("voteGranted = %v, candidate = %v, args.LastLogTerm = %v, lastLogTerm = %v, args.LastLogIndex = %v, lastLogIndex = %v", reply.VoteGranted, args.CandidateID, args.LastLogTerm, lastLogTerm, args.LastLogIndex, lastLogIndex)
 	if reply.VoteGranted {
 		rf.votedFor = args.CandidateID
 	}
@@ -235,7 +235,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // the struct itself.
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	rf.printLog("Sending sendRequestVote to %v, args: %v", server, args)
+	// rf.printLog("Sending sendRequestVote to %v, args: %v", server, args)
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
 }
@@ -379,13 +379,12 @@ func (rf *Raft) runCandidate() {
 		done := rf.startElection(cancel)
 		timeout := time.After(randomElectionTimeout())
 
-		waitingForResult := true
-		for rf.role == candidate && waitingForResult {
+		restartElection := false
+		for rf.role == candidate && !restartElection {
 			select {
 			case <-done:
-				waitingForResult = false
 			case <-timeout:
-				waitingForResult = false
+				restartElection = true
 			case <-rf.incomingRPC:
 			}
 		}
@@ -589,7 +588,7 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	rf.printLog("Sending AppendEntries to %v, args.Entries: %v, args.Term: %v, args.LeaderCommit: %v, log: %v", server, args.Entries, args.Term, args.LeaderCommit, rf.log)
+	// rf.printLog("Sending AppendEntries to %v, args.Entries: %v, args.Term: %v, args.LeaderCommit: %v, log: %v", server, args.Entries, args.Term, args.LeaderCommit, rf.log)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
@@ -598,7 +597,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 
-	rf.printLog("Received AppendEntries from %v, args.Term = %v", args.LeaderID, args.Term)
+	//rf.printLog("Received AppendEntries from %v, args.Term = %v", args.LeaderID, args.Term)
 	if args.Term >= rf.currentTerm {
 		rf.initFollower(args.Term)
 	}
