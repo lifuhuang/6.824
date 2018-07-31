@@ -511,7 +511,11 @@ func (rf *Raft) sendAppendEntriesToServer(server int, args *AppendEntriesArgs) {
 			for i := args.PrevLogIndex + 1; rf.tryCommit(i); i++ {
 			}
 		} else {
-			rf.nextIndex[server]--
+			nextIndex := rf.nextIndex[server]
+			for nextIndex-1 >= reply.SuggestedNextLogIndex && rf.log[nextIndex-1].Term != reply.SuggestedNextLogTerm {
+				nextIndex--
+			}
+			rf.nextIndex[server] = nextIndex
 		}
 	}
 }
@@ -578,8 +582,10 @@ type AppendEntriesArgs struct {
 }
 
 type AppendEntriesReply struct {
-	Term    int
-	Success bool
+	Term                  int
+	Success               bool
+	SuggestedNextLogTerm  int
+	SuggestedNextLogIndex int
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
@@ -593,16 +599,29 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.mu.Unlock()
 
 	rf.printLog("Received AppendEntries from %v, args.Term = %v", args.LeaderID, args.Term)
-	if args.Term > rf.currentTerm {
+	if args.Term >= rf.currentTerm {
 		rf.initFollower(args.Term)
 	}
 
 	reply.Term = rf.currentTerm
-	if args.Term == rf.currentTerm && rf.role == follower {
-		reply.Success = rf.appendEntriesToLogs(args)
-		rf.printLog("log Len: %v, Entries: %v", len(rf.log), rf.log)
-	} else {
+	if args.Term < rf.currentTerm {
+		reply.SuggestedNextLogTerm = -1
+		reply.SuggestedNextLogIndex = -1
 		reply.Success = false
+	} else if args.PrevLogIndex > len(rf.log)-1 {
+		reply.SuggestedNextLogIndex = len(rf.log)
+		reply.SuggestedNextLogTerm = -1
+		reply.Success = false
+	} else if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.SuggestedNextLogIndex = args.PrevLogIndex
+		reply.SuggestedNextLogTerm = rf.log[reply.SuggestedNextLogIndex].Term
+		for reply.SuggestedNextLogIndex-1 > 0 && rf.log[reply.SuggestedNextLogIndex-1].Term == reply.SuggestedNextLogTerm {
+			reply.SuggestedNextLogIndex--
+		}
+		reply.Success = false
+	} else {
+		rf.appendEntriesToLogs(args)
+		reply.Success = true
 	}
 
 	rf.lastHeartBeat = time.Now()
@@ -611,11 +630,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	return
 }
 
-func (rf *Raft) appendEntriesToLogs(args *AppendEntriesArgs) bool {
-	if len(rf.log)-1 < args.PrevLogIndex || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
-		return false
-	}
-
+func (rf *Raft) appendEntriesToLogs(args *AppendEntriesArgs) {
 	for i := 0; i < len(args.Entries); i++ {
 		pos := args.PrevLogIndex + 1 + i
 		if pos == len(rf.log) || rf.log[pos].Term != args.Entries[i].Term {
@@ -627,7 +642,7 @@ func (rf *Raft) appendEntriesToLogs(args *AppendEntriesArgs) bool {
 	lastNewEntryIndex := args.PrevLogIndex + len(args.Entries)
 	rf.updateCommitIndex(min(lastNewEntryIndex, args.LeaderCommit))
 
-	return true
+	return
 }
 
 func min(x, y int) int {
