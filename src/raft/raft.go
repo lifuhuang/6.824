@@ -508,17 +508,7 @@ func (rf *Raft) sendAppendEntriesToServer(server int, args *AppendEntriesArgs) {
 		if reply.Success {
 			rf.nextIndex[server] = args.PrevLogIndex + len(args.Entries) + 1
 			rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
-			left := rf.commitIndex + 1
-			right := len(rf.log) - 1
-			middle := 0
-			for left <= right {
-				middle = (left + right) / 2
-				if rf.tryCommit(middle) {
-					left = middle + 1
-				} else {
-					right = middle - 1
-				}
-			}
+			searchLast(rf.commitIndex+1, len(rf.log)-1, rf.tryCommit)
 		} else {
 			nextIndex := rf.nextIndex[server]
 			for nextIndex-1 >= reply.SuggestedNextLogIndex && rf.log[nextIndex-1].Term != reply.SuggestedNextLogTerm {
@@ -527,6 +517,34 @@ func (rf *Raft) sendAppendEntriesToServer(server int, args *AppendEntriesArgs) {
 			rf.nextIndex[server] = nextIndex
 		}
 	}
+}
+
+func searchLast(left int, right int, predicate func(int) bool) int {
+	if left > right || !predicate(left) {
+		return -1
+	}
+
+	// Linear search
+	if right-left < 5 {
+		ans := left
+		for ans+1 <= right && predicate(ans+1) {
+			ans++
+		}
+		return ans
+	}
+
+	// Binary search
+	ans := -1
+	for left <= right {
+		middle := (left + right) / 2
+		if predicate(middle) {
+			ans = middle
+			left = middle + 1
+		} else {
+			right = middle - 1
+		}
+	}
+	return ans
 }
 
 func (rf *Raft) broadcastAppendEntries() {
