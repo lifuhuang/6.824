@@ -18,7 +18,9 @@ package raft
 //
 
 import (
+	"bytes"
 	"fmt"
+	"labgob"
 	"labrpc"
 	"math/rand"
 	"sync"
@@ -115,36 +117,40 @@ func (rf *Raft) GetState() (int, bool) {
 // see paper's Figure 2 for a description of what should be persistent.
 //
 func (rf *Raft) persist() {
-	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	buffer := new(bytes.Buffer)
+	encoder := labgob.NewEncoder(buffer)
+	encoder.Encode(rf.currentTerm)
+	encoder.Encode(rf.votedFor)
+	encoder.Encode(rf.log)
+	data := buffer.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 //
 // restore previously persisted state.
 //
 func (rf *Raft) readPersist(data []byte) {
-	if data == nil || len(data) < 1 { // bootstrap without any state?
+	if data == nil || len(data) < 1 {
+		rf.printLog("WARNING: data is empty, bootstraping with initial state.")
 		return
 	}
-	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+
+	buffer := bytes.NewBuffer(data)
+	decoder := labgob.NewDecoder(buffer)
+
+	var currentTerm int
+	var votedFor int
+	var log []LogEntry
+	if decoder.Decode(&currentTerm) != nil ||
+		decoder.Decode(&votedFor) != nil ||
+		decoder.Decode(&log) != nil {
+		rf.printLog("WARNING: failed to readPersist, bootstraping with initial state.")
+		return
+	}
+
+	rf.currentTerm = currentTerm
+	rf.votedFor = votedFor
+	rf.log = log
 }
 
 //
@@ -177,6 +183,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 
 	// initialize follower
 	if args.Term > rf.currentTerm {
@@ -264,6 +271,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 
 	rf.log = append(rf.log, LogEntry{Term: rf.currentTerm, Command: command})
+	rf.persist()
 
 	return len(rf.log) - 1, rf.currentTerm, true
 }
@@ -314,6 +322,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
+	rf.printLog("Read persist")
 	go func() {
 		for {
 			switch rf.role {
@@ -331,7 +340,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 		for range rf.commitIndexUpdated {
 			for {
 				rf.mu.Lock()
-				if rf.lastApplied == rf.commitIndex {
+				if rf.lastApplied >= rf.commitIndex {
 					rf.mu.Unlock()
 					break
 				}
@@ -508,7 +517,14 @@ func (rf *Raft) sendAppendEntriesToServer(server int, args *AppendEntriesArgs) {
 		if reply.Success {
 			rf.nextIndex[server] = args.PrevLogIndex + len(args.Entries) + 1
 			rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
-			searchLast(rf.commitIndex+1, len(rf.log)-1, rf.tryCommit)
+			left := args.PrevLogIndex + 1
+			right := args.PrevLogIndex + len(args.Entries)
+			newLeft := SearchFirst(left, right, func(x int) bool { return rf.log[x].Term == rf.currentTerm })
+			if newLeft == -1 {
+				return
+			}
+			rf.printLog("left = %v, right = %v, newLeft = %v", left, right, newLeft)
+			SearchLast(newLeft, right, rf.tryCommit)
 		} else {
 			nextIndex := rf.nextIndex[server]
 			for nextIndex-1 >= reply.SuggestedNextLogIndex && rf.log[nextIndex-1].Term != reply.SuggestedNextLogTerm {
@@ -517,34 +533,6 @@ func (rf *Raft) sendAppendEntriesToServer(server int, args *AppendEntriesArgs) {
 			rf.nextIndex[server] = nextIndex
 		}
 	}
-}
-
-func searchLast(left int, right int, predicate func(int) bool) int {
-	if left > right || !predicate(left) {
-		return -1
-	}
-
-	// Linear search
-	if right-left < 5 {
-		ans := left
-		for ans+1 <= right && predicate(ans+1) {
-			ans++
-		}
-		return ans
-	}
-
-	// Binary search
-	ans := -1
-	for left <= right {
-		middle := (left + right) / 2
-		if predicate(middle) {
-			ans = middle
-			left = middle + 1
-		} else {
-			right = middle - 1
-		}
-	}
-	return ans
 }
 
 func (rf *Raft) broadcastAppendEntries() {
@@ -568,7 +556,7 @@ func (rf *Raft) tryCommit(index int) bool {
 		return false
 	}
 
-	if rf.commitIndex >= index {
+	if index <= rf.commitIndex {
 		return true
 	}
 
@@ -581,20 +569,19 @@ func (rf *Raft) tryCommit(index int) bool {
 
 	rf.printLog("tryCommit(%v), count = %v", index, count)
 	if count > len(rf.peers)/2 {
-		rf.updateCommitIndex(index)
+		rf.printLog("Commit rf.log[%v] = %v", index, rf.log[index])
+		rf.setCommitIndex(index)
 		return true
 	}
 
 	return false
 }
 
-func (rf *Raft) updateCommitIndex(index int) {
-	if index > rf.commitIndex {
-		rf.commitIndex = index
-		go func() {
-			rf.commitIndexUpdated <- struct{}{}
-		}()
-	}
+func (rf *Raft) setCommitIndex(index int) {
+	rf.commitIndex = index
+	go func() {
+		rf.commitIndexUpdated <- struct{}{}
+	}()
 }
 
 type AppendEntriesArgs struct {
@@ -622,6 +609,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
+	defer rf.persist()
 
 	//rf.printLog("Received AppendEntries from %v, args.Term = %v", args.LeaderID, args.Term)
 	if args.Term >= rf.currentTerm {
@@ -665,32 +653,10 @@ func (rf *Raft) appendEntriesToLogs(args *AppendEntriesArgs) {
 	}
 
 	lastNewEntryIndex := args.PrevLogIndex + len(args.Entries)
-	rf.updateCommitIndex(min(lastNewEntryIndex, args.LeaderCommit))
+
+	rf.setCommitIndex(Min(lastNewEntryIndex, args.LeaderCommit))
 
 	return
-}
-
-func min(x, y int) int {
-	if x < y {
-		return x
-	}
-	return y
-}
-
-func (rf *Raft) printLogTemp(format string, values ...interface{}) {
-	var role string
-	switch rf.role {
-	case follower:
-		role = "follower "
-	case candidate:
-		role = "candidate"
-	case leader:
-		role = "leader   "
-	}
-
-	message := fmt.Sprintf(format, values...)
-
-	fmt.Printf("time: %v, term: %v, raft: %v, role: %v: %v\n", time.Now().Format("15:04:05.000"), rf.currentTerm, rf.me, role, message)
 }
 
 func (rf *Raft) printLog(format string, values ...interface{}) {
@@ -732,5 +698,5 @@ func (rf *Raft) initLeader() {
 }
 
 func randomElectionTimeout() time.Duration {
-	return time.Duration(150+rand.Int()%150) * time.Millisecond
+	return time.Duration(100+rand.Int()%100) * time.Millisecond
 }
