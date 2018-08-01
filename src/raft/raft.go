@@ -91,7 +91,7 @@ const (
 	leader
 )
 
-const heartBeatPeriod = time.Duration(150) * time.Millisecond
+const heartBeatPeriod = time.Duration(50) * time.Millisecond
 
 // return currentTerm and whether this server
 // believes it is the leader.
@@ -373,7 +373,7 @@ func (rf *Raft) runFollower() {
 }
 
 func (rf *Raft) runCandidate() {
-	rf.printLog("New candidate")
+	//rf.printLog("New candidate")
 	for rf.role == candidate {
 		cancel := make(chan struct{})
 		done := rf.startElection(cancel)
@@ -456,7 +456,7 @@ func (rf *Raft) startElection(cancel <-chan struct{}) <-chan struct{} {
 				rf.mu.Lock()
 				if rf.currentTerm == args.Term {
 					rf.initLeader()
-					rf.printLog("won election")
+					rf.printLog("Won election")
 				}
 				rf.mu.Unlock()
 				return
@@ -484,9 +484,11 @@ func (rf *Raft) createAppendEntriesArgs(server int) *AppendEntriesArgs {
 		PrevLogTerm:  rf.log[nextIndex-1].Term,
 		Term:         rf.currentTerm,
 	}
-	if nextIndex < len(rf.log) {
-		args.Entries = append(args.Entries, rf.log[nextIndex])
+
+	for i := nextIndex; i < len(rf.log); i++ {
+		args.Entries = append(args.Entries, rf.log[i])
 	}
+
 	return args
 }
 
@@ -506,8 +508,16 @@ func (rf *Raft) sendAppendEntriesToServer(server int, args *AppendEntriesArgs) {
 		if reply.Success {
 			rf.nextIndex[server] = args.PrevLogIndex + len(args.Entries) + 1
 			rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
-
-			for i := args.PrevLogIndex + 1; rf.tryCommit(i); i++ {
+			left := rf.commitIndex + 1
+			right := len(rf.log) - 1
+			middle := 0
+			for left <= right {
+				middle = (left + right) / 2
+				if rf.tryCommit(middle) {
+					left = middle + 1
+				} else {
+					right = middle - 1
+				}
 			}
 		} else {
 			nextIndex := rf.nextIndex[server]
@@ -564,9 +574,7 @@ func (rf *Raft) updateCommitIndex(index int) {
 	if index > rf.commitIndex {
 		rf.commitIndex = index
 		go func() {
-			rf.printLogTemp("updating CommitIndex index = %v", index)
 			rf.commitIndexUpdated <- struct{}{}
-			rf.printLogTemp("updated CommitIndex index = %v", index)
 		}()
 	}
 }
@@ -706,5 +714,5 @@ func (rf *Raft) initLeader() {
 }
 
 func randomElectionTimeout() time.Duration {
-	return time.Duration(200+rand.Int()%800) * time.Millisecond
+	return time.Duration(150+rand.Int()%150) * time.Millisecond
 }
