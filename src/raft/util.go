@@ -13,10 +13,15 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 }
 
 func SearchFirst(left int, right int, predicate func(int) bool) int {
-	if left > right || !predicate(left) {
+	if left > right || !predicate(right) {
 		return -1
 	}
-	return SearchLast(left, right, func(x int) bool { return !predicate(x) }) + 1
+	last := SearchLast(left, right, func(x int) bool { return !predicate(x) })
+	if last == -1 {
+		return left
+	} else {
+		return last + 1
+	}
 }
 
 func SearchLast(left int, right int, predicate func(int) bool) int {
@@ -34,7 +39,7 @@ func SearchLast(left int, right int, predicate func(int) bool) int {
 	}
 
 	// Binary search
-	ans := -1
+	var ans int
 	for left <= right {
 		middle := (left + right) / 2
 		if predicate(middle) {

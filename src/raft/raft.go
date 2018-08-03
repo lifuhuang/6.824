@@ -552,7 +552,7 @@ func (rf *Raft) sendAppendEntriesToServer(server int, args *AppendEntriesArgs) {
 			left := args.PrevLogIndex + 1
 			right := args.PrevLogIndex + len(args.Entries)
 			newLeft := SearchFirst(left, right, func(x int) bool { return rf.log[x].Term == rf.currentTerm })
-			rf.printLog("left = %v, right = %v, newLeft = %v", left, right, newLeft)
+			rf.printLog("left = %v, right = %v, newLeft = %v, entries = %v", left, right, newLeft, args.Entries)
 			if newLeft == -1 {
 				return
 			}
