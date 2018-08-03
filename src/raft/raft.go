@@ -74,9 +74,8 @@ type Raft struct {
 	matchIndex []int
 
 	// Extra fields
-	incomingRPC        chan struct{}
+	heartBeat          chan struct{}
 	commitIndexUpdated chan struct{}
-	lastHeartBeat      time.Time
 }
 
 type LogEntry struct {
@@ -187,6 +186,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	// initialize follower
 	if args.Term > rf.currentTerm {
 		rf.initFollower(args.Term)
+		rf.postHeartBeat()
 	}
 
 	// rf.printLog("Received RequestVote")
@@ -205,13 +205,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if reply.VoteGranted {
 		rf.votedFor = args.CandidateID
 	}
-
-	go func() {
-		select {
-		case rf.incomingRPC <- struct{}{}:
-		default:
-		}
-	}()
 
 	return
 }
@@ -321,9 +314,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.commitIndex = 0
 	rf.lastApplied = 0
 
-	rf.incomingRPC = make(chan struct{})
+	rf.heartBeat = make(chan struct{})
 	rf.commitIndexUpdated = make(chan struct{})
-	rf.lastHeartBeat = time.Unix(0, 0)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -369,25 +361,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 }
 
 func (rf *Raft) runFollower() {
-	timeout := randomElectionTimeout()
-	timer := time.NewTimer(timeout)
 	for rf.getRoleWithLock() == follower {
 		select {
-		case <-timer.C:
+		case <-time.After(randomElectionTimeout()):
 			rf.mu.Lock()
 			rf.initCandidate()
 			rf.mu.Unlock()
-		case <-rf.incomingRPC:
-			rf.mu.Lock()
-			lastHeartBeat := rf.lastHeartBeat
-			rf.mu.Unlock()
-			if lastHeartBeat.Add(timeout).After(time.Now()) {
-				timeout = randomElectionTimeout()
-				timer.Reset(timeout)
-			}
+		case <-rf.heartBeat:
 		}
 	}
-	timer.Stop()
 }
 
 func (rf *Raft) getRoleWithLock() Role {
@@ -409,7 +391,7 @@ func (rf *Raft) runCandidate() {
 			case <-done:
 			case <-timeout:
 				restartElection = true
-			case <-rf.incomingRPC:
+			case <-rf.heartBeat:
 			}
 		}
 		close(cancel)
@@ -422,7 +404,7 @@ func (rf *Raft) runLeader() {
 		select {
 		case <-time.After(heartBeatPeriod):
 			rf.broadcastAppendEntries()
-		case <-rf.incomingRPC:
+		case <-rf.heartBeat:
 		}
 	}
 }
@@ -635,16 +617,20 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.persist()
 
 	//rf.printLog("Received AppendEntries from %v, args.Term = %v", args.LeaderID, args.Term)
+	if args.Term < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		reply.SuggestedNextLogTerm = -1
+		reply.SuggestedNextLogIndex = -1
+		reply.Success = false
+		return
+	}
+
 	if args.Term >= rf.currentTerm {
 		rf.initFollower(args.Term)
 	}
 
 	reply.Term = rf.currentTerm
-	if args.Term < rf.currentTerm {
-		reply.SuggestedNextLogTerm = -1
-		reply.SuggestedNextLogIndex = -1
-		reply.Success = false
-	} else if args.PrevLogIndex > len(rf.log)-1 {
+	if args.PrevLogIndex > len(rf.log)-1 {
 		reply.SuggestedNextLogIndex = len(rf.log)
 		reply.SuggestedNextLogTerm = -1
 		reply.Success = false
@@ -660,15 +646,16 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = true
 	}
 
-	rf.lastHeartBeat = time.Now()
-	go func() {
-		select {
-		case rf.incomingRPC <- struct{}{}:
-		default:
-		}
-	}()
+	rf.postHeartBeat()
 
 	return
+}
+
+func (rf *Raft) postHeartBeat() {
+	select {
+	case rf.heartBeat <- struct{}{}:
+	default:
+	}
 }
 
 func (rf *Raft) appendEntriesToLogs(args *AppendEntriesArgs) {
@@ -738,5 +725,5 @@ func (rf *Raft) initLeader() {
 }
 
 func randomElectionTimeout() time.Duration {
-	return time.Duration(100+rand.Int()%100) * time.Millisecond
+	return time.Duration(150+rand.Int()%150) * time.Millisecond
 }
