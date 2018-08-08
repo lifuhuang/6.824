@@ -38,7 +38,7 @@ func TestInitialElection2A(t *testing.T) {
 	time.Sleep(2 * RaftElectionTimeout)
 	term2 := cfg.checkTerms()
 	if term1 != term2 {
-		fmt.Printf("warning: term changed even though there wer3 no failures")
+		fmt.Printf("warning: term changed even though there were no failures")
 	}
 
 	// there should still be a leader.
@@ -652,6 +652,7 @@ func TestFigure82C(t *testing.T) {
 
 	nup := servers
 	for iters := 0; iters < 1000; iters++ {
+		fmt.Printf("time: %v iter: %v\n", time.Now().Format("15:04:05.000"), iters)
 		leader := -1
 		for i := 0; i < servers; i++ {
 			if cfg.rafts[i] != nil {
@@ -691,7 +692,6 @@ func TestFigure82C(t *testing.T) {
 			cfg.connect(i)
 		}
 	}
-
 	cfg.one(rand.Int(), servers, true)
 
 	cfg.end()

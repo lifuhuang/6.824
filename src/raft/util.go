@@ -65,3 +65,5 @@ func Max(x, y int) int {
 	}
 	return y
 }
+
+var enableLog = false

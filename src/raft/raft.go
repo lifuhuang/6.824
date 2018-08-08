@@ -91,10 +91,9 @@ const (
 	follower Role = iota
 	candidate
 	leader
-	dead
 )
 
-const heartBeatPeriod = time.Duration(50) * time.Millisecond
+const heartBeatPeriod = time.Millisecond * 100
 
 // return currentTerm and whether this server
 // believes it is the leader.
@@ -249,7 +248,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 // the struct itself.
 //
 func (rf *Raft) sendRequestVote(server int, args *RequestVoteArgs, reply *RequestVoteReply) bool {
-	// rf.printLog("Sending sendRequestVote to %v, args: %v", server, args)
+	rf.printLog("Sending sendRequestVote to %v, args: %v", server, args)
 	ok := rf.peers[server].Call("Raft.RequestVote", args, reply)
 	return ok
 }
@@ -279,6 +278,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	rf.log = append(rf.log, LogEntry{Term: rf.currentTerm, Command: command})
 	rf.persist("Start")
+	rf.printLog("New command %v stored at %v", command, len(rf.log)-1)
 
 	return len(rf.log) - 1, rf.currentTerm, true
 }
@@ -363,10 +363,6 @@ func (rf *Raft) applyComittedLogEntries(applyCh chan ApplyMsg) {
 	for range rf.commitIndexUpdated {
 		for {
 			rf.mu.Lock()
-			if rf.role == dead {
-				rf.mu.Unlock()
-				return
-			}
 
 			if rf.lastApplied >= rf.commitIndex {
 				rf.mu.Unlock()
@@ -391,19 +387,19 @@ func (rf *Raft) applyComittedLogEntries(applyCh chan ApplyMsg) {
 
 func (rf *Raft) runFollower() {
 	for rf.getRoleWithLock() == follower {
+		timer := time.NewTimer(randomElectionTimeout())
 		select {
-		case <-time.After(randomElectionTimeout()):
+		case <-timer.C:
 			rf.mu.Lock()
 			rf.initCandidate()
 			rf.mu.Unlock()
 		case <-rf.heartBeat:
 		}
+		timer.Stop()
 	}
 }
 
 func (rf *Raft) getRoleWithLock() Role {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	return rf.role
 }
 
@@ -428,14 +424,18 @@ func (rf *Raft) runCandidate() {
 }
 
 func (rf *Raft) runLeader() {
+	// rf.printLog("Start running as leader!")
 	rf.broadcastAppendEntries()
-	for rf.getRoleWithLock() == leader {
+	ticker := time.NewTicker(heartBeatPeriod)
+	for rf.role == leader {
 		select {
-		case <-time.After(heartBeatPeriod):
+		case <-ticker.C:
+			// rf.printLog("broadcasting appendEntries.")
 			rf.broadcastAppendEntries()
 		case <-rf.heartBeat:
 		}
 	}
+	ticker.Stop()
 }
 
 func (rf *Raft) startElection(cancel <-chan struct{}) <-chan struct{} {
@@ -445,7 +445,7 @@ func (rf *Raft) startElection(cancel <-chan struct{}) <-chan struct{} {
 	rf.votedFor = rf.me
 	rf.currentTerm++
 	rf.persist("startElection")
-	rf.printLog("Starting election")
+	// rf.printLog("Starting election")
 
 	args := &RequestVoteArgs{
 		CandidateID:  rf.me,
@@ -493,7 +493,7 @@ func (rf *Raft) startElection(cancel <-chan struct{}) <-chan struct{} {
 
 			if totalVotes > nPeers/2 {
 				rf.mu.Lock()
-				if rf.currentTerm == args.Term {
+				if rf.role == candidate && rf.currentTerm == args.Term {
 					rf.initLeader()
 					rf.printLog("Won election")
 				}
@@ -508,13 +508,6 @@ func (rf *Raft) startElection(cancel <-chan struct{}) <-chan struct{} {
 
 func (rf *Raft) createAppendEntriesArgs(server int) *AppendEntriesArgs {
 	nextIndex := rf.nextIndex[server]
-	if nextIndex-1 >= len(rf.log) {
-		rf.printLog("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-		rf.printLog("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-		rf.printLog("len(rf.log) = %v, rf.nextIndex[%v] = %v", len(rf.log), server, rf.nextIndex[server])
-		rf.printLog("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-		rf.printLog("!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!")
-	}
 	args := &AppendEntriesArgs{
 		Entries:      []LogEntry{},
 		LeaderCommit: rf.commitIndex,
@@ -532,10 +525,11 @@ func (rf *Raft) createAppendEntriesArgs(server int) *AppendEntriesArgs {
 }
 
 func (rf *Raft) sendAppendEntriesToServer(server int, args *AppendEntriesArgs) {
+	rf.printLog("entering sendAppendEntriesToServer")
 	reply := new(AppendEntriesReply)
 
 	if !rf.sendAppendEntries(server, args, reply) {
-		//rf.printLog("sendAppendEntries failed")
+		rf.printLog("sendAppendEntries failed")
 		return
 	}
 
@@ -549,14 +543,16 @@ func (rf *Raft) sendAppendEntriesToServer(server int, args *AppendEntriesArgs) {
 		if reply.Success {
 			rf.nextIndex[server] = args.PrevLogIndex + len(args.Entries) + 1
 			rf.matchIndex[server] = args.PrevLogIndex + len(args.Entries)
-			left := args.PrevLogIndex + 1
-			right := args.PrevLogIndex + len(args.Entries)
-			newLeft := SearchFirst(left, right, func(x int) bool { return rf.log[x].Term == rf.currentTerm })
-			rf.printLog("left = %v, right = %v, newLeft = %v, entries = %v", left, right, newLeft, args.Entries)
-			if newLeft == -1 {
-				return
+			if len(args.Entries) > 0 {
+				left := args.PrevLogIndex + 1
+				right := args.PrevLogIndex + len(args.Entries)
+				newLeft := SearchFirst(left, right, func(x int) bool { return rf.log[x].Term == rf.currentTerm })
+				rf.printLog("left = %v, right = %v, newLeft = %v, entries = %v", left, right, newLeft, args.Entries)
+				if newLeft == -1 {
+					return
+				}
+				SearchLast(newLeft, right, rf.tryCommit)
 			}
-			SearchLast(newLeft, right, rf.tryCommit)
 		} else {
 			nextIndex := rf.nextIndex[server]
 			for nextIndex-1 >= reply.SuggestedNextLogIndex && rf.log[nextIndex-1].Term != reply.SuggestedNextLogTerm {
@@ -601,7 +597,6 @@ func (rf *Raft) tryCommit(index int) bool {
 
 	rf.printLog("tryCommit(%v), count = %v", index, count)
 	if count > len(rf.peers)/2 {
-		rf.printLog("Commit rf.log[%v] = %v", index, rf.log[index])
 		rf.setCommitIndex(index)
 		return true
 	}
@@ -611,6 +606,7 @@ func (rf *Raft) tryCommit(index int) bool {
 
 func (rf *Raft) setCommitIndex(index int) {
 	rf.commitIndex = index
+	rf.printLog("Committed rf.log[%v]= {Term: %v, Command: %v}", index, rf.log[index].Term, rf.log[index].Command)
 	go func() {
 		select {
 		case rf.commitIndexUpdated <- struct{}{}:
@@ -636,7 +632,7 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	// rf.printLog("Sending AppendEntries to %v, args.Entries: %v, args.Term: %v, args.LeaderCommit: %v, log: %v", server, args.Entries, args.Term, args.LeaderCommit, rf.log)
+	rf.printLog("Sending AppendEntries to %v, args.Entries: %v, args.Term: %v, args.LeaderCommit: %v, log: %v", server, args.Entries, args.Term, args.LeaderCommit, rf.log)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
@@ -646,7 +642,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	defer rf.mu.Unlock()
 	defer rf.persist("AppendEntries")
 
-	rf.printLog("Received AppendEntries from %v, args.Term = %v, arg.Entries = %v", args.LeaderID, args.Term, args.Entries)
+	rf.printLog("Received AppendEntries from %v, args.Term = %v, args.PrevLogTerm = %v, args.PrevLogIndex = %v,  args.Entries = %v", args.LeaderID, args.Term, args.PrevLogTerm, args.PrevLogIndex, args.Entries)
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
 		reply.SuggestedNextLogTerm = -1
@@ -666,7 +662,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 		reply.Success = false
 	} else if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
 		reply.SuggestedNextLogIndex = args.PrevLogIndex
-		reply.SuggestedNextLogTerm = rf.log[reply.SuggestedNextLogIndex].Term
+		reply.SuggestedNextLogTerm = rf.log[args.PrevLogIndex].Term
 		for reply.SuggestedNextLogIndex-1 > 0 && rf.log[reply.SuggestedNextLogIndex-1].Term == reply.SuggestedNextLogTerm {
 			reply.SuggestedNextLogIndex--
 		}
@@ -711,7 +707,7 @@ func (rf *Raft) printLogWithLock(format string, values ...interface{}) {
 }
 
 func (rf *Raft) printLog(format string, values ...interface{}) {
-	if !rf.alive {
+	if !rf.alive || !enableLog {
 		return
 	}
 
@@ -757,5 +753,5 @@ func (rf *Raft) initLeader() {
 }
 
 func randomElectionTimeout() time.Duration {
-	return time.Duration(150+rand.Int()%150) * time.Millisecond
+	return time.Duration(250+rand.Int()%250) * time.Millisecond
 }
