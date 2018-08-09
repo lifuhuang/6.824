@@ -296,7 +296,8 @@ func (rf *Raft) Kill() {
 	rf.mu.Lock()
 	rf.role = dead
 	rf.persist()
-	rf.postHeartBeat()
+	close(rf.commitIndexUpdated)
+	close(rf.heartBeat)
 	rf.mu.Unlock()
 }
 
@@ -361,6 +362,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 }
 
 func (rf *Raft) applyComittedLogEntries(applyCh chan ApplyMsg) {
+	defer close(applyCh)
 	for range rf.commitIndexUpdated {
 		for {
 			rf.mu.Lock()
