@@ -64,7 +64,6 @@ type Raft struct {
 	currentTerm int
 	votedFor    int
 	log         []LogEntry
-	alive       bool
 
 	// Volatile state on all servers.
 	commitIndex int
@@ -91,6 +90,7 @@ const (
 	follower Role = iota
 	candidate
 	leader
+	dead
 )
 
 const heartBeatPeriod = time.Millisecond * 100
@@ -116,14 +116,14 @@ func (rf *Raft) GetState() (int, bool) {
 // where it can later be retrieved after a crash and restart.
 // see paper's Figure 2 for a description of what should be persistent.
 //
-func (rf *Raft) persist(location string) {
+func (rf *Raft) persist() {
 	// rf.printLog("Persist from %v --- rf.currentTerm = %v, rf.votedFor = %v, log = %v", location, rf.currentTerm, rf.votedFor, rf.log)
 	buffer := new(bytes.Buffer)
 	encoder := labgob.NewEncoder(buffer)
 	encoder.Encode(rf.currentTerm)
 	encoder.Encode(rf.votedFor)
 	encoder.Encode(rf.log)
-	encoder.Encode(rf.alive)
+	encoder.Encode(rf.role == dead)
 	data := buffer.Bytes()
 	rf.persister.SaveRaftState(data)
 }
@@ -143,12 +143,12 @@ func (rf *Raft) readPersist(data []byte) {
 	var currentTerm int
 	var votedFor int
 	var log []LogEntry
-	var alive bool
+	var isDead bool
 
 	if decoder.Decode(&currentTerm) != nil ||
 		decoder.Decode(&votedFor) != nil ||
 		decoder.Decode(&log) != nil ||
-		decoder.Decode(&alive) != nil {
+		decoder.Decode(&isDead) != nil {
 		rf.printLog("WARNING: failed to readPersist, bootstraping with initial state.")
 		return
 	}
@@ -157,7 +157,9 @@ func (rf *Raft) readPersist(data []byte) {
 	rf.currentTerm = currentTerm
 	rf.votedFor = votedFor
 	rf.log = log
-	rf.alive = alive
+	if isDead {
+		rf.role = dead
+	}
 }
 
 //
@@ -190,7 +192,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	defer rf.persist("RequestVote")
+	defer rf.persist()
 
 	// initialize follower
 	if args.Term > rf.currentTerm {
@@ -277,7 +279,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	}
 
 	rf.log = append(rf.log, LogEntry{Term: rf.currentTerm, Command: command})
-	rf.persist("Start")
+	rf.persist()
 	rf.printLog("New command %v stored at %v", command, len(rf.log)-1)
 
 	return len(rf.log) - 1, rf.currentTerm, true
@@ -292,9 +294,8 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	// Your code here, if desired.
 	rf.mu.Lock()
-	rf.alive = false
-	rf.persist("Kill")
-	rf.role = -1
+	rf.role = dead
+	rf.persist()
 	rf.postHeartBeat()
 	rf.mu.Unlock()
 }
@@ -322,7 +323,6 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentTerm = 0
 	rf.votedFor = -1
 	rf.log = []LogEntry{LogEntry{}}
-	rf.alive = true
 
 	// Volatile state on all servers
 	rf.role = follower
@@ -335,11 +335,11 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
-	// rf.printLog("Read persist")
-	if !rf.alive {
+	if rf.role == dead {
 		return rf
 	}
 
+	// rf.printLog("Read persist")
 	go func() {
 		for {
 			switch rf.getRoleWithLock() {
@@ -349,8 +349,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 				rf.runCandidate()
 			case leader:
 				rf.runLeader()
-			default:
-				rf.printLog("Invalid role, exiting...")
+			case dead:
+				return
 			}
 		}
 	}()
@@ -359,10 +359,15 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	return rf
 }
+
 func (rf *Raft) applyComittedLogEntries(applyCh chan ApplyMsg) {
 	for range rf.commitIndexUpdated {
 		for {
 			rf.mu.Lock()
+			if rf.role == dead {
+				rf.mu.Unlock()
+				return
+			}
 
 			if rf.lastApplied >= rf.commitIndex {
 				rf.mu.Unlock()
@@ -400,6 +405,8 @@ func (rf *Raft) runFollower() {
 }
 
 func (rf *Raft) getRoleWithLock() Role {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	return rf.role
 }
 
@@ -427,7 +434,7 @@ func (rf *Raft) runLeader() {
 	// rf.printLog("Start running as leader!")
 	rf.broadcastAppendEntries()
 	ticker := time.NewTicker(heartBeatPeriod)
-	for rf.role == leader {
+	for rf.getRoleWithLock() == leader {
 		select {
 		case <-ticker.C:
 			// rf.printLog("broadcasting appendEntries.")
@@ -444,7 +451,7 @@ func (rf *Raft) startElection(cancel <-chan struct{}) <-chan struct{} {
 
 	rf.votedFor = rf.me
 	rf.currentTerm++
-	rf.persist("startElection")
+	rf.persist()
 	// rf.printLog("Starting election")
 
 	args := &RequestVoteArgs{
@@ -632,7 +639,7 @@ type AppendEntriesReply struct {
 }
 
 func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *AppendEntriesReply) bool {
-	rf.printLog("Sending AppendEntries to %v, args.Entries: %v, args.Term: %v, args.LeaderCommit: %v, log: %v", server, args.Entries, args.Term, args.LeaderCommit, rf.log)
+	rf.printLog("Sending AppendEntries to %v, args.Entries: %v, args.Term: %v, args.LeaderCommit: %v", server, args.Entries, args.Term, args.LeaderCommit)
 	ok := rf.peers[server].Call("Raft.AppendEntries", args, reply)
 	return ok
 }
@@ -640,8 +647,7 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	defer rf.persist("AppendEntries")
-
+	defer rf.persist()
 	rf.printLog("Received AppendEntries from %v, args.Term = %v, args.PrevLogTerm = %v, args.PrevLogIndex = %v,  args.Entries = %v", args.LeaderID, args.Term, args.PrevLogTerm, args.PrevLogIndex, args.Entries)
 	if args.Term < rf.currentTerm {
 		reply.Term = rf.currentTerm
@@ -707,7 +713,7 @@ func (rf *Raft) printLogWithLock(format string, values ...interface{}) {
 }
 
 func (rf *Raft) printLog(format string, values ...interface{}) {
-	if !rf.alive || !enableLog {
+	if !enableLog || rf.role == dead {
 		return
 	}
 
