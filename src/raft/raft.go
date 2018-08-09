@@ -297,7 +297,7 @@ func (rf *Raft) Kill() {
 	rf.role = dead
 	rf.persist()
 	close(rf.commitIndexUpdated)
-	close(rf.heartBeat)
+	rf.postHeartBeat()
 	rf.mu.Unlock()
 }
 
