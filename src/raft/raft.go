@@ -616,12 +616,10 @@ func (rf *Raft) tryCommit(index int) bool {
 func (rf *Raft) setCommitIndex(index int) {
 	rf.commitIndex = index
 	rf.printLog("Committed rf.log[%v]= {Term: %v, Command: %v}", index, rf.log[index].Term, rf.log[index].Command)
-	go func() {
-		select {
-		case rf.commitIndexUpdated <- struct{}{}:
-		default:
-		}
-	}()
+	select {
+	case rf.commitIndexUpdated <- struct{}{}:
+	default:
+	}
 }
 
 type AppendEntriesArgs struct {
